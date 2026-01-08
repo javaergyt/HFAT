@@ -12,11 +12,12 @@ import os
 from collections import OrderedDict
 import random
 import wandb
-from torch.cuda.amp import autocast, GradScaler
+# 移除 AMP 相关的引用
+# from torch.cuda.amp import autocast, GradScaler
 
 # 引入自定义工具和模型
 from utils import get_dataloaders, attack_pgd, mixup_data, mixup_criterion
-# 【重要】引入修改后的 ResNet18
+# 引入修改后的 ResNet18
 from models.resnet18_gtsrb import GTSRB_ResNet18
 
 # Set device
@@ -49,13 +50,12 @@ def add_into_weights(model, diff, coeff=1.0):
 
 def get_args():
     parser = argparse.ArgumentParser()
-    # 默认改为 ResNet18
     parser.add_argument('--model', default='ResNet18')
     parser.add_argument('--l2', default=0, type=float)
     parser.add_argument('--l1', default=0, type=float)
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--batch_size_test', default=128, type=int)
-    parser.add_argument('--data_dir', default='./data', type=str)  # 数据目录
+    parser.add_argument('--data_dir', default='./data', type=str)
 
     parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--lr_schedule', default='piecewise')
@@ -79,7 +79,6 @@ def get_args():
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', default=0, type=int)
 
-    # 移除了 Cutout 和 width_factor (ResNet不需要)
     parser.add_argument('--mixup', action='store_true')
     parser.add_argument('--mixup_alpha', type=float, default=1.0)
     parser.add_argument('--eval', action='store_true')
@@ -150,9 +149,8 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-    # torch.cuda.manual_seed_all(args.seed)
 
-    # ================= 数据加载 (使用 utils 中的新函数) =================
+    # ================= 数据加载 =================
     train_loader, test_loader = get_dataloaders(args)
 
     epsilon = (args.epsilon / 255.)
@@ -163,11 +161,10 @@ def main():
 
     # ================= 模型初始化 =================
     if args.model == 'ResNet18':
-        print("Initialize GTSRB_ResNet18...")
+        logger.info("Initialize GTSRB_ResNet18...")
         model = GTSRB_ResNet18(num_classes=43)
         proxy = GTSRB_ResNet18(num_classes=43)
     else:
-        # 兼容其他模型，但建议 GTSRB 只用 ResNet18
         raise ValueError("Please use --model ResNet18 for GTSRB")
 
     model = nn.DataParallel(model).to(device)
@@ -189,7 +186,8 @@ def main():
     opt = torch.optim.SGD(params, lr=args.lr_max, momentum=0.9, weight_decay=5e-4)
     proxy_opt = torch.optim.SGD(proxy.parameters(), lr=args.lr_proxy_max)
 
-    scaler = GradScaler()
+    # 移除 Scaler
+    # scaler = GradScaler()
     criterion = nn.CrossEntropyLoss()
 
     # 学习率调度
@@ -201,8 +199,11 @@ def main():
                 return args.lr_max / 10.
             else:
                 return args.lr_max / 100.
+    elif args.lr_schedule == 'cosine':
+        def lr_schedule(t):
+            return args.lr_max * 0.5 * (1 + math.cos(math.pi * t / args.epochs))
     else:
-        lr_schedule = lambda t: args.lr_max  # 简化其他情况，可根据需要补全
+        lr_schedule = lambda t: args.lr_max
 
     best_test_robust_acc = 0
     start_epoch = 0
@@ -214,18 +215,22 @@ def main():
             start_epoch = args.resume
             logger.info(f'Resuming at epoch {start_epoch}')
 
-    logger.info('Epoch \t Train Time \t Test Time \t LR \t Train Loss \t Train Acc \t Test Acc \t Test Robust Acc')
+    logger.info(
+        'Epoch \t Train Time \t Test Time \t LR \t Train Loss \t Train Acc \t Train Robust Loss \t Train Robust Acc \t Test Loss \t Test Acc \t Test Robust Loss \t Test Robust Acc')
 
     # ================= 训练循环 =================
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
-        train_loss = 0
-        train_acc = 0
-        train_robust_loss = 0
-        train_robust_acc = 0
+
+        train_loss_nat = 0  # 自然 Loss
+        train_acc = 0  # 自然 Acc
+        train_loss_rob = 0  # 鲁棒 Loss
+        train_acc_rob = 0  # 鲁棒 Acc
         train_n = 0
 
-        # 使用 standard DataLoader，返回 (X, y)
+        # 训练模式
+        model.train()
+
         for i, (X, y) in enumerate(train_loader):
             X, y = X.to(device), y.to(device)
 
@@ -242,163 +247,199 @@ def main():
                     delta = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters, args.restarts, args.norm,
                                        mixup=True, y_a=y_a, y_b=y_b, lam=lam)
                 else:
-                    # 使用 Aux 参数生成对抗样本
                     delta = attack_pgd(model, X, y, aux_epsilon, aux_pgd_alpha, args.aux_attack_iters, args.restarts,
                                        args.norm)
                 delta = delta.detach()
             elif args.attack == 'none':
                 delta = torch.zeros_like(X)
 
-            # [重要] 这里不要 normalize，因为模型会做
             X_adv_raw = torch.clamp(X + delta, min=lower_limit, max=upper_limit)
-
-            # 这里的 X_adv_raw 仍然是 [0, 1] 范围
             diff = X - X_adv_raw
 
-            # 计算 eps_beta 扰动
             eps_beta = np.random.normal(args.mean, args.std_dev)
             X_adv_eps = torch.clamp(X_adv_raw + eps_beta * diff + args.eps_gamma * torch.randn_like(X).to(device),
                                     min=lower_limit, max=upper_limit)
 
-            model.train()
+            # --- Proxy Update (FP32) ---
+            if isinstance(proxy, nn.DataParallel):
+                proxy.module.load_state_dict(model.module.state_dict())
+            else:
+                proxy.load_state_dict(model.state_dict())
 
-            # --- Proxy Update ---
-            proxy.load_state_dict(model.state_dict())
             proxy.train()
-
-            with autocast():
-                # proxy 直接接收 [0, 1] 数据
-                loss = nn.CrossEntropyLoss(reduction='none')(proxy(X_adv_eps), y)
-                Indicator = (loss < args.lt).float()
-                loss = -1 * (loss.mul(Indicator).mean())
-
+            # 移除 autocast
+            loss = nn.CrossEntropyLoss(reduction='none')(proxy(X_adv_eps), y)
+            Indicator = (loss < args.lt).float()
+            loss = -1 * (loss.mul(Indicator).mean())
             proxy_opt.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(proxy_opt)
-            scaler.update()
+            loss.backward()  # 直接 backward
+            proxy_opt.step()  # 直接 step
+            # scaler.update()
 
             diff_weights = diff_in_weights(model, proxy)
-            add_into_weights(model, diff_weights, coeff=1.0 * args.awp_gamma)
+            if epoch >= args.awp_warmup:
+                add_into_weights(model, diff_weights, coeff=1.0 * args.awp_gamma)
 
-            # --- 生成 u_delta (用于 Hider Loss) ---
+            # --- Hider Loss (FP32) ---
             u_delta = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters, args.restarts, args.norm)
             X_u_adv = torch.clamp(X + u_delta, min=lower_limit, max=upper_limit)
 
-            # --- [Pass 1: Hider Loss] ---
-            with autocast():
-                u_robust_output = model(X_u_adv)  # model input [0,1]
-                loss_wv = criterion(u_robust_output, y)
-                if args.l1:
-                    for name, param in model.named_parameters():
-                        if 'bn' not in name and 'bias' not in name:
-                            loss_wv += args.l1 * param.abs().sum()
+            # 移除 autocast
+            u_robust_output = model(X_u_adv)
+            loss_wv = criterion(u_robust_output, y)
+            if args.l1:
+                for name, param in model.named_parameters():
+                    if 'bn' not in name and 'bias' not in name:
+                        loss_wv += args.l1 * param.abs().sum()
 
             opt.zero_grad()
-            scaler.scale(loss_wv).backward()
+            loss_wv.backward()  # 直接 backward
+            if epoch >= args.awp_warmup:
+                add_into_weights(model, diff_weights, coeff=-1.0 * args.awp_gamma)
 
-            # 移除 awp 权重
-            add_into_weights(model, diff_weights, coeff=-1.0 * args.awp_gamma)
-
-            # 保存梯度 (Scaled)
             wv_gradient_dict = OrderedDict()
             with torch.no_grad():
                 for name, param in model.named_parameters():
                     if param.grad is not None:
                         wv_gradient_dict[name] = param.grad.clone()
 
-            # --- [Pass 2: Standard Robust Loss] ---
-            # 重新计算 X_adv (基于主攻击参数)
+            # --- Standard Robust Loss (FP32) ---
             if args.attack != 'none':
                 delta_main = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters, args.restarts, args.norm)
                 X_adv = torch.clamp(X + delta_main, min=lower_limit, max=upper_limit)
             else:
                 X_adv = X
 
-            robust_output = model(X_adv)  # model input [0,1]
-
-            with autocast():
-                loss_w = criterion(robust_output, y)
+            robust_output = model(X_adv)
+            # 移除 autocast
+            loss_w = criterion(robust_output, y)
 
             opt.zero_grad()
-            scaler.scale(loss_w).backward()
-            scaler.unscale_(opt)  # Unscale gradients
+            loss_w.backward()  # 直接 backward
+            # scaler.unscale_(opt)
 
-            # --- KL Divergence Weighting ---
+            # --- KL Divergence ---
             with torch.no_grad():
-                robust_n_output = model(X)  # Natural output, input [0,1]
-
-                # 重新计算 u_robust (clean weights)
+                robust_n_output = model(X)
                 u_robust_n_output = model(X)
-
-                # 注意：这里可能需要根据你的原始逻辑确认是否需要再 inference 一次
-                # 你的原始代码中 u_robust_output 是在 AWP 权重下计算的
-                # 这里为了简单，假设结构不变
 
                 kl_robust = F.kl_div(F.log_softmax(robust_output, dim=1),
                                      F.softmax(robust_n_output, dim=1),
                                      reduction='sum')
-
                 kl_u_robust = F.kl_div(F.log_softmax(u_robust_output, dim=1),
                                        F.softmax(u_robust_n_output, dim=1),
                                        reduction='sum')
-
                 w_tensor = torch.stack([kl_robust, kl_u_robust])
                 w_tensor[0] = w_tensor[0] * args.beta_r
                 w_tensor[1] = w_tensor[1] * args.beta_u
                 w_softmax = F.softmax(w_tensor, dim=0)
                 w_r, w_u = w_softmax[0], w_softmax[1]
 
-            # --- Gradient Mixing ---
-            inv_scale = 1.0 / scaler.get_scale()
+            # --- Gradient Mixing (FP32) ---
+            # 移除 scaler.get_scale()
+            inv_scale = 1.0
+
             with torch.no_grad():
                 for name, param in model.named_parameters():
                     if param.grad is not None:
-                        # g_hider 需要手动 unscale
                         g_hider = wv_gradient_dict[name] * inv_scale
                         param.grad = w_r * param.grad + w_u * g_hider
 
-            scaler.step(opt)
-            scaler.update()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()  # 直接 step
+            # scaler.update()
 
-            # Logging
-            train_loss += loss_w.item() * y.size(0)
-            train_acc += (robust_n_output.max(1)[1] == y).sum().item()
-            train_n += y.size(0)
+            # --- 统计训练集指标 ---
+            with torch.no_grad():
+                loss_nat = criterion(robust_n_output, y)
+
+                train_loss_nat += loss_nat.item() * y.size(0)
+                train_acc += (robust_n_output.max(1)[1] == y).sum().item()
+
+                train_loss_rob += loss_w.item() * y.size(0)
+                train_acc_rob += (robust_output.max(1)[1] == y).sum().item()
+
+                train_n += y.size(0)
 
         train_time = time.time()
 
         # ================= 测试循环 =================
-        should_test = (epoch + 1) % 4 == 0 or (epoch + 1) >= (epochs - 10)
+        model.eval()
 
-        if should_test:
-            model.eval()
-            test_loss = 0
-            test_acc = 0
-            test_robust_acc = 0
-            test_n = 0
+        test_loss_nat = 0
+        test_acc = 0
+        test_loss_rob = 0
+        test_acc_rob = 0
+        test_n = 0
 
-            for i, (X, y) in enumerate(test_loader):
-                X, y = X.to(device), y.to(device)
+        for i, (X, y) in enumerate(test_loader):
+            X, y = X.to(device), y.to(device)
 
-                # PGD Test
-                delta = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters_test, args.restarts, args.norm)
-                delta = delta.detach()
+            # PGD Test
+            delta = attack_pgd(model, X, y, epsilon, pgd_alpha, args.attack_iters_test, args.restarts, args.norm)
+            delta = delta.detach()
 
-                X_adv = torch.clamp(X + delta, min=lower_limit, max=upper_limit)
-                robust_output = model(X_adv)  # Input [0,1]
-                output = model(X)  # Input [0,1]
+            X_adv = torch.clamp(X + delta, min=lower_limit, max=upper_limit)
 
-                test_robust_acc += (robust_output.max(1)[1] == y).sum().item()
+            with torch.no_grad():
+                robust_output = model(X_adv)
+                output = model(X)
+
+                # 计算 Loss
+                loss_clean = criterion(output, y)
+                loss_adv = criterion(robust_output, y)
+
+                # 累加统计
+                test_loss_nat += loss_clean.item() * y.size(0)
                 test_acc += (output.max(1)[1] == y).sum().item()
+
+                test_loss_rob += loss_adv.item() * y.size(0)
+                test_acc_rob += (robust_output.max(1)[1] == y).sum().item()
+
                 test_n += y.size(0)
 
-            print(f"Epoch {epoch}: Test Acc: {test_acc / test_n:.4f}, Robust Acc: {test_robust_acc / test_n:.4f}")
-
-            if (test_robust_acc / test_n > best_test_robust_acc) and (epoch > 50):
-                best_test_robust_acc = test_robust_acc / test_n
-                torch.save(model.state_dict(), os.path.join(save_dir, f'model_best.pth'))
-
         test_time = time.time()
+
+        # 计算平均值
+        avg_train_loss_nat = train_loss_nat / train_n
+        avg_train_acc = train_acc / train_n
+        avg_train_loss_rob = train_loss_rob / train_n
+        avg_train_acc_rob = train_acc_rob / train_n
+
+        avg_test_loss_nat = test_loss_nat / test_n
+        avg_test_acc = test_acc / test_n
+        avg_test_loss_rob = test_loss_rob / test_n
+        avg_test_acc_rob = test_acc_rob / test_n
+
+        # 打印所有指标
+        logger.info(
+            f"{epoch} \t {train_time - start_time:.1f} \t {test_time - train_time:.1f} \t {lr:.4f} \t "
+            f"{avg_train_loss_nat:.4f} \t {avg_train_acc:.4f} \t {avg_train_loss_rob:.4f} \t {avg_train_acc_rob:.4f} \t "
+            f"{avg_test_loss_nat:.4f} \t {avg_test_acc:.4f} \t {avg_test_loss_rob:.4f} \t {avg_test_acc_rob:.4f}"
+        )
+
+        # 记录到 WandB
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": avg_train_loss_nat,
+            "train_acc": avg_train_acc,
+            "train_robust_loss": avg_train_loss_rob,
+            "train_robust_acc": avg_train_acc_rob,
+            "test_loss": avg_test_loss_nat,
+            "test_acc": avg_test_acc,
+            "test_robust_loss": avg_test_loss_rob,
+            "test_robust_acc": avg_test_acc_rob,
+            "lr": lr
+        })
+
+        # 保存最佳模型
+        if avg_test_acc_rob > best_test_robust_acc and epoch > 0:
+            best_test_robust_acc = avg_test_acc_rob
+            torch.save(model.state_dict(), os.path.join(save_dir, f'model_best.pth'))
+            logger.info(f"==> Best Robust Acc: {best_test_robust_acc:.4f} at epoch {epoch}")
+
+        if (epoch + 1) % args.chkpt_iters == 0:
+            torch.save(model.state_dict(), os.path.join(save_dir, f'model_{epoch}.pth'))
 
 
 if __name__ == "__main__":
